@@ -68,3 +68,9 @@ environment slot. Each shard also embeds its episode metadata. GPU batches are
 verified before publication. Repeat the same command to resume from complete
 shards. `--num-envs` sets the batch size and `--video-envs` sets the number of
 preview videos per camera and shard. All environments retain raw RGB in HDF5.
+
+Render an equal-scale overview of recorded and target paths by trajectory family:
+
+```bash
+.venv/bin/python -m spatial_motion.plot_corpus spatial_motion/run_corpus --output spatial_motion/run_corpus/trajectory_overview.png
+```
