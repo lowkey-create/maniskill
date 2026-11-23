@@ -35,3 +35,13 @@ Existing DrawSVG outputs can be checked without editing them:
 ```bash
 .venv/bin/python -m spatial_motion.audit_drawsvg results/signature results/test results/flower results/svg_A
 ```
+
+## Plot recorded TCP paths
+
+Install matplotlib in the project environment if needed. The plot overlays the
+target and measured TCP in the Panda base frame and shows per-step error.
+The shaded interval marks the endpoint hold.
+
+```bash
+.venv/bin/python -m spatial_motion.plot_trajectories spatial_motion/run_rgb --output spatial_motion/run_rgb/trajectories.png
+```
