@@ -41,6 +41,8 @@ def verify(directory):
                 for slot in range(b):
                     assert np.std(frames[0, slot]) > 0
                     assert np.any(frames[0, slot] != frames[n // 3, slot])
+                    if slot >= h5.attrs.get("video_envs", b):
+                        continue
                     path = directory / f"{camera}_env{slot:03d}.mp4"
                     probe = json.loads(subprocess.check_output([
                         "ffprobe", "-v", "error", "-select_streams", "v:0",

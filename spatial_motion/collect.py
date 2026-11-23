@@ -18,7 +18,8 @@ def as_numpy(tensor):
     return tensor if isinstance(tensor, np.ndarray) else tensor.detach().cpu().numpy()
 
 
-def run_episode(env, targets, directory, render, hold, tolerance, seed, name, renderer=None):
+def run_episode(env, targets, directory, render, hold, tolerance, seed, name, renderer=None,
+                video_envs=None, episodes=None):
     directory.mkdir()
     raw = env.unwrapped
     obs, _ = env.reset(seed=seed)
@@ -27,6 +28,7 @@ def run_episode(env, targets, directory, render, hold, tolerance, seed, name, re
     robot = raw.agent.robot
     batch = raw.num_envs
     fps = raw.control_freq
+    video_envs = batch if video_envs is None else min(video_envs, batch)
     targets = np.concatenate((targets, np.repeat(targets[-1:], hold, axis=0)))
     count = len(targets)
     arm = raw.agent.controller.controllers["arm"]
@@ -49,6 +51,12 @@ def run_episode(env, targets, directory, render, hold, tolerance, seed, name, re
             sim_backend=raw.backend.sim_backend, render_backend=render,
             render_device=renderer.device if renderer is not None else str(raw.backend.render_backend),
         )
+        if render != "none":
+            h5.attrs["video_envs"] = video_envs
+        if episodes is not None:
+            h5.create_dataset("episode/metadata_json", data=[json.dumps(item, ensure_ascii=False)
+                                                            for item in episodes],
+                              dtype=h5py.string_dtype("utf-8"))
         qpos = h5.create_dataset("state/qpos", (count + 1, batch, 9), "f4")
         qvel = h5.create_dataset("state/qvel", qpos.shape, "f4")
         tcp = h5.create_dataset("state/tcp_pose_base", (count + 1, batch, 7), "f4")
@@ -81,7 +89,7 @@ def run_episode(env, targets, directory, render, hold, tolerance, seed, name, re
                                            (count + 1, *tensor.shape), "f4")
                     for key, tensor in obs["sensor_param"][camera].items()
                 }
-                for index in range(batch):
+                for index in range(video_envs):
                     path = directory / f"{camera}_env{index:03d}.mp4"
                     videos[camera, index] = stack.enter_context(closing(imageio.get_writer(
                         path, fps=fps, codec="libx264",
@@ -98,8 +106,8 @@ def run_episode(env, targets, directory, render, hold, tolerance, seed, name, re
                 rgb[camera][index] = frames
                 for key, dataset in calibration[camera].items():
                     dataset[index] = as_numpy(observation["sensor_param"][camera][key])
-                for slot, frame in enumerate(frames):
-                    videos[camera, slot].append_data(frame)
+                for slot in range(video_envs):
+                    videos[camera, slot].append_data(frames[slot])
             return tcp_pose[:, :3]
 
         current = record_state(0, obs)
@@ -131,6 +139,8 @@ def run_episode(env, targets, directory, render, hold, tolerance, seed, name, re
     result = {
         "trajectory": name, "num_envs": batch, "tracking_steps": count - hold,
         "hold_steps": hold, "control_hz": fps, "render": render,
+        "video_envs": video_envs if render != "none" else 0,
+        "video_envs": video_envs if render != "none" else 0,
         "rms_mm": (1000 * np.sqrt(np.mean(tracking ** 2, axis=0))).tolist(),
         "p95_mm": (1000 * np.percentile(tracking, 95, axis=0)).tolist(),
         "max_mm": (1000 * np.max(tracking, axis=0)).tolist(),

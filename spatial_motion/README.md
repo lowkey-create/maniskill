@@ -45,3 +45,23 @@ The shaded interval marks the endpoint hold.
 ```bash
 .venv/bin/python -m spatial_motion.plot_trajectories spatial_motion/run_rgb --output spatial_motion/run_rgb/trajectories.png
 ```
+
+## Generate a language-conditioned corpus
+
+On a CUDA and Vulkan host, run from the repository root:
+
+```bash
+OMP_NUM_THREADS=1 IMAGEIO_FFMPEG_EXE=/usr/bin/ffmpeg .venv/bin/python -m spatial_motion.generate_corpus --output spatial_motion/run_corpus
+```
+
+The defaults generate 256 train and 64 held-out-size test episodes across eight
+families, including two sequential compositions. Both splits contain the same
+families and use disjoint size grids. This measures parameter generalization.
+Each episode includes an English instruction with geometry and direction, and
+keeps both RGB streams and the original observation/action alignment.
+
+`manifest.json` indexes the split, instruction, parameters, HDF5 shard and
+environment slot. Each shard also embeds its episode metadata. GPU batches are
+verified before publication. Repeat the same command to resume from complete
+shards. `--num-envs` sets the batch size and `--video-envs` sets the number of
+preview videos per camera and shard. All environments retain raw RGB in HDF5.
