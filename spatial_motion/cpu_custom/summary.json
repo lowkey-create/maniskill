@@ -1,0 +1,24 @@
+[
+  {
+    "trajectory": "custom",
+    "num_envs": 1,
+    "tracking_steps": 100,
+    "hold_steps": 30,
+    "control_hz": 20,
+    "render": "none",
+    "rms_mm": [
+      0.3128431737422943
+    ],
+    "p95_mm": [
+      0.30739694833755493
+    ],
+    "max_mm": [
+      0.5925831198692322
+    ],
+    "final_mm": [
+      0.04606127738952637
+    ],
+    "tolerance_mm": 10.0,
+    "passed": true
+  }
+]

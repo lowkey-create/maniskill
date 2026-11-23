@@ -1,0 +1,90 @@
+[
+  {
+    "trajectory": "line",
+    "num_envs": 1,
+    "tracking_steps": 240,
+    "hold_steps": 30,
+    "control_hz": 20,
+    "render": "software",
+    "rms_mm": [
+      0.17956604063510895
+    ],
+    "p95_mm": [
+      0.17750440537929535
+    ],
+    "max_mm": [
+      0.4001777768135071
+    ],
+    "final_mm": [
+      0.006613228935748339
+    ],
+    "tolerance_mm": 10.0,
+    "passed": true
+  },
+  {
+    "trajectory": "diagonal",
+    "num_envs": 1,
+    "tracking_steps": 240,
+    "hold_steps": 30,
+    "control_hz": 20,
+    "render": "software",
+    "rms_mm": [
+      0.24250662326812744
+    ],
+    "p95_mm": [
+      0.24138382077217102
+    ],
+    "max_mm": [
+      0.44471052289009094
+    ],
+    "final_mm": [
+      0.017241811379790306
+    ],
+    "tolerance_mm": 10.0,
+    "passed": true
+  },
+  {
+    "trajectory": "circle",
+    "num_envs": 1,
+    "tracking_steps": 240,
+    "hold_steps": 30,
+    "control_hz": 20,
+    "render": "software",
+    "rms_mm": [
+      0.43261632323265076
+    ],
+    "p95_mm": [
+      0.4411412477493286
+    ],
+    "max_mm": [
+      1.0662829875946045
+    ],
+    "final_mm": [
+      0.008646566420793533
+    ],
+    "tolerance_mm": 10.0,
+    "passed": true
+  },
+  {
+    "trajectory": "helix",
+    "num_envs": 1,
+    "tracking_steps": 240,
+    "hold_steps": 30,
+    "control_hz": 20,
+    "render": "software",
+    "rms_mm": [
+      0.8412472009658813
+    ],
+    "p95_mm": [
+      0.8928571343421936
+    ],
+    "max_mm": [
+      2.107714891433716
+    ],
+    "final_mm": [
+      0.02699846401810646
+    ],
+    "tolerance_mm": 10.0,
+    "passed": true
+  }
+]

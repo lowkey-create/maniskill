@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.py[cod]
+.env
+results/
+*.h5
+*.mp4
+*.log
+svg_bench/raw/
+svg_bench/clean/
+svg_bench/repos/
+spatial_motion/.render_deps/
+spatial_motion/run*/
