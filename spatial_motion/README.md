@@ -1,6 +1,8 @@
 # SpatialMotion-v1
 
-ManiSkill 3.0.1, Panda, 20 Hz control. References and tracking errors are metres in the Panda base frame. Import `spatial_motion` before calling `gym.make("SpatialMotion-v1")`. The action is Panda's normalized `pd_ee_delta_pos` with `root_translation`; the first three components map to +/-0.1 m per axis and the fourth controls the gripper. The collector keeps the gripper open and clips its Cartesian command to +/-0.015 m per axis. It calculates feedback from the measured TCP at every step.
+ManiSkill 3.0.1, Panda, 20 Hz control. Import `spatial_motion` before calling `gym.make("SpatialMotion-v1")`. The default controller is Panda's absolute `pd_ee_pose`. The collector sends each Panda-base XYZ waypoint in metres, holds the reset orientation using XYZ Euler angles in radians, and keeps the gripper open. ManiSkill computes pose error and joint targets. Each waypoint occupies one control step, followed by a configurable endpoint hold.
+
+New recordings store seven action values `[x_m, y_m, z_m, rx_rad, ry_rad, rz_rad, gripper]`. Old four-value `pd_ee_delta_pos` recordings remain readable by the verifier. For callers replaying legacy actions, select `control_mode="pd_ee_delta_pos"` explicitly. Use a fresh corpus directory when switching control modes.
 
 Run from `maniskill_project/`. Use a fresh output directory for each run.
 
@@ -57,6 +59,7 @@ OMP_NUM_THREADS=1 IMAGEIO_FFMPEG_EXE=/usr/bin/ffmpeg .venv/bin/python -m spatial
 The defaults generate 256 train and 64 held-out-size test episodes across eight
 families, including two sequential compositions. Both splits contain the same
 families and use disjoint size grids. This measures parameter generalization.
+Each trajectory uses 240 reference steps and 20 endpoint hold steps by default.
 Each episode includes an English instruction with geometry and direction, and
 keeps both RGB streams and the original observation/action alignment.
 

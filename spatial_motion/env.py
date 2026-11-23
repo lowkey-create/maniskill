@@ -9,7 +9,7 @@ from mani_skill.utils.building.ground import build_ground
 from mani_skill.utils.registration import register_env
 
 CAMERAS = ("third_view", "wrist")
-CONTROL_MODE = "pd_ee_delta_pos"
+CONTROL_MODE = "pd_ee_pose"
 
 @register_env("SpatialMotion-v1", max_episode_steps=20000)
 class SpatialMotionEnv(BaseEnv):
@@ -17,8 +17,8 @@ class SpatialMotionEnv(BaseEnv):
     SUPPORTED_REWARD_MODES = ["none"]
 
     def __init__(self, *args, robot_uids="panda", control_mode=CONTROL_MODE, **kwargs):
-        if control_mode != CONTROL_MODE:
-            raise ValueError(f"SpatialMotion requires {CONTROL_MODE}")
+        if control_mode not in (CONTROL_MODE, "pd_ee_delta_pos"):
+            raise ValueError(f"Unsupported SpatialMotion control mode: {control_mode}")
         super().__init__(*args, robot_uids=robot_uids, control_mode=control_mode, **kwargs)
 
     def _load_agent(self, options):

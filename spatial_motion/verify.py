@@ -12,7 +12,10 @@ def verify(directory):
     metrics = json.loads((directory / "metrics.json").read_text())
     with h5py.File(directory / "expert.h5") as h5:
         n, b, d = h5["action"].shape
-        assert bool(h5.attrs["complete"]) and d == 4
+        mode = h5.attrs["control_mode"]
+        assert bool(h5.attrs["complete"]) and (mode, d) in (
+            ("pd_ee_delta_pos", 4), ("pd_ee_pose", 7),
+        )
         assert h5["state/qpos"].shape == h5["state/qvel"].shape == (n + 1, b, 9)
         assert h5["state/tcp_pose_base"].shape == (n + 1, b, 7)
         assert not h5["terminated"][:].any() and not h5["truncated"][:].any()
@@ -23,15 +26,17 @@ def verify(directory):
         np.testing.assert_allclose(h5["error_xyz_base_m"][:], error)
         np.testing.assert_allclose(h5["error_norm_m"][:], norm)
         action = h5["action"][:]
+        if mode == "pd_ee_pose":
+            np.testing.assert_array_equal(action[..., :3], target)
         for key in ("state/qpos", "state/qvel", "state/tcp_pose_base", "action"):
             assert np.isfinite(h5[key][:]).all(), key
         with (directory / "tracking.csv").open() as file:
             rows = np.loadtxt(file, delimiter=",", skiprows=1, ndmin=2)
-        assert rows.shape == (n * b, 17)
+        assert rows.shape == (n * b, 13 + d)
         np.testing.assert_allclose(rows[:, 0], np.repeat(np.arange(n), b))
         np.testing.assert_allclose(rows[:, 1], np.tile(np.arange(b), n))
         np.testing.assert_allclose(rows[:, 3:], np.concatenate(
-            (target, tcp, error, norm[..., None], action), axis=-1).reshape(n * b, 14))
+            (target, tcp, error, norm[..., None], action), axis=-1).reshape(n * b, 10 + d))
         videos = {}
         if metrics["render"] != "none":
             assert set(h5["rgb"]) == {"third_view", "wrist"}

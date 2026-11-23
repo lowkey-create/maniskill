@@ -9,9 +9,13 @@ import gymnasium as gym
 import h5py
 import numpy as np
 import torch
+from mani_skill.utils.geometry.rotation_conversions import matrix_to_euler_angles, quaternion_to_matrix
 
 from .env import CAMERAS, CONTROL_MODE
 from .trajectories import NAMES, load_waypoints, reference
+
+ACTION_COLUMNS = ("target_x_m", "target_y_m", "target_z_m",
+                  "target_rx_rad", "target_ry_rad", "target_rz_rad", "gripper")
 
 
 def as_numpy(tensor):
@@ -32,12 +36,13 @@ def run_episode(env, targets, directory, render, hold, tolerance, seed, name, re
     targets = np.concatenate((targets, np.repeat(targets[-1:], hold, axis=0)))
     count = len(targets)
     arm = raw.agent.controller.controllers["arm"]
-    if arm.config.frame != "root_translation" or not arm.config.normalize_action:
-        raise RuntimeError("Unexpected Panda Cartesian controller configuration")
-    scale = float(arm.config.pos_upper)
-    if float(arm.config.pos_lower) != -scale:
-        raise RuntimeError("Expected symmetric Panda delta range")
+    if (arm.config.frame != "root_translation:root_aligned_body_rotation"
+            or arm.config.normalize_action or arm.config.use_delta):
+        raise RuntimeError("Expected absolute Panda base-frame pose commands")
     target_tensor = torch.as_tensor(targets, device=raw.device)
+    reset_rotation = matrix_to_euler_angles(
+        quaternion_to_matrix(raw.tcp_in_base.q), "XYZ"
+    )
     grip = torch.ones((batch, 1), device=raw.device)
     errors = np.empty((count, batch), np.float32)
 
@@ -45,7 +50,7 @@ def run_episode(env, targets, directory, render, hold, tolerance, seed, name, re
         h5 = stack.enter_context(h5py.File(directory / "expert.h5", "w"))
         h5.attrs.update(
             env_id="SpatialMotion-v1", control_mode=CONTROL_MODE, frame="panda_base",
-            position_unit="m", arm_delta_scale_m=scale, action_layout="dx,dy,dz,gripper",
+            position_unit="m", rotation_unit="rad", action_layout=",".join(ACTION_COLUMNS),
             control_hz=fps, seed=seed, trajectory=name, hold_steps=hold,
             state_alignment="state[t], action[t], state[t+1]", complete=False,
             sim_backend=raw.backend.sim_backend, render_backend=render,
@@ -60,7 +65,7 @@ def run_episode(env, targets, directory, render, hold, tolerance, seed, name, re
         qpos = h5.create_dataset("state/qpos", (count + 1, batch, 9), "f4")
         qvel = h5.create_dataset("state/qvel", qpos.shape, "f4")
         tcp = h5.create_dataset("state/tcp_pose_base", (count + 1, batch, 7), "f4")
-        actions = h5.create_dataset("action", (count, batch, 4), "f4")
+        actions = h5.create_dataset("action", (count, batch, len(ACTION_COLUMNS)), "f4")
         h5.create_dataset("target_xyz_base_m", data=targets)
         error_vectors = h5.create_dataset("error_xyz_base_m", targets.shape, "f4")
         norms = h5.create_dataset("error_norm_m", errors.shape, "f4")
@@ -69,8 +74,7 @@ def run_episode(env, targets, directory, render, hold, tolerance, seed, name, re
         rows = csv.writer(stack.enter_context((directory / "tracking.csv").open("w", newline="")))
         rows.writerow(["step", "env", "time_s", "target_x_m", "target_y_m", "target_z_m",
                        "tcp_x_m", "tcp_y_m", "tcp_z_m", "error_x_m", "error_y_m",
-                       "error_z_m", "error_norm_m", "action_dx", "action_dy", "action_dz",
-                       "action_gripper"])
+                       "error_z_m", "error_norm_m", *(f"action_{key}" for key in ACTION_COLUMNS)])
 
         videos = {}
         rgb = {}
@@ -110,11 +114,9 @@ def run_episode(env, targets, directory, render, hold, tolerance, seed, name, re
                     videos[camera, slot].append_data(frames[slot])
             return tcp_pose[:, :3]
 
-        current = record_state(0, obs)
+        record_state(0, obs)
         for step, target in enumerate(target_tensor):
-            # Feedback from the measured TCP, with a 15 mm per-axis command limit.
-            arm_action = (2.0 * (target - current) / scale).clamp(-0.015 / scale, 0.015 / scale)
-            action = torch.cat((arm_action, grip), dim=1)
+            action = torch.cat((target, reset_rotation, grip), dim=1)
             obs, _, term, trunc, _ = env.step(action)
             if renderer is not None:
                 obs = renderer.capture()

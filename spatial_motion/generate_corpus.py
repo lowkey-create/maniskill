@@ -8,6 +8,7 @@ import gymnasium as gym
 import numpy as np
 
 from .collect import as_numpy, run_episode
+from .env import CONTROL_MODE
 from .verify import verify
 
 KINDS = ("line", "diagonal", "circle", "ellipse", "helix", "zigzag",
@@ -93,6 +94,7 @@ def record(args):
     output = args.output
     output.mkdir(parents=True, exist_ok=True)
     config = {k: v for k, v in vars(args).items() if k != "output"}
+    config["control_mode"] = CONTROL_MODE
     config_path = output / "config.json"
     if config_path.exists():
         if json.loads(config_path.read_text()) != config:
@@ -157,7 +159,7 @@ if __name__ == "__main__":
     parser.add_argument("--test-per-kind", type=int, default=8)
     parser.add_argument("--num-envs", type=int, default=64)
     parser.add_argument("--video-envs", type=int, default=2)
-    parser.add_argument("--steps", type=int, default=180)
+    parser.add_argument("--steps", type=int, default=240)
     parser.add_argument("--hold", type=int, default=20)
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--tolerance-mm", type=float, default=10)
