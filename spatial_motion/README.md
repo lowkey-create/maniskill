@@ -74,3 +74,28 @@ Render an equal-scale overview of recorded and target paths by trajectory family
 ```bash
 .venv/bin/python -m spatial_motion.plot_corpus spatial_motion/run_corpus --output spatial_motion/run_corpus/trajectory_overview.png
 ```
+
+### Diverse three-dimensional trajectories
+
+Run from the repository root on a CUDA and Vulkan host:
+
+```bash
+OMP_NUM_THREADS=1 IMAGEIO_FFMPEG_EXE=/usr/bin/ffmpeg .venv/bin/python -m spatial_motion.generate_corpus \
+  --pattern diverse-v1 --output spatial_motion/run_diverse_hz01/corpus \
+  --num-envs 128 --train-per-kind 36 --test-per-kind 8
+```
+
+This configuration generates 792 episodes in 18 families. It includes eight
+single motions and ten compositions using ordered segments, simultaneous vector
+addition, or addition with a delayed start and early finish. Reversed orders
+are available for line/circle and circle/helix. Component scales, phase windows,
+direction, axes and plane are recorded in each HDF5 episode's metadata and the
+corpus manifest. The primary scale uses an even-mm training grid and an odd-mm
+test grid. The split measures generalization to held-out primary scales within
+the same families.
+
+A short approach moves the Panda to its sampled start before the first saved
+observation. The recorded horizon is fixed across a batch but the time spent
+moving varies. Use `motion_samples` to find the moving reference interval.
+References then repeat the endpoint up to the fixed horizon and explicit hold.
+The manifest includes the motion duration and commanded mean and peak speed.

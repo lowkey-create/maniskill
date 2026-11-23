@@ -7,12 +7,15 @@ from tempfile import TemporaryDirectory
 import gymnasium as gym
 import numpy as np
 
+from . import diverse_patterns
 from .collect import as_numpy, run_episode
 from .env import CONTROL_MODE
 from .verify import verify
 
 KINDS = ("line", "diagonal", "circle", "ellipse", "helix", "zigzag",
          "line_circle", "circle_helix")
+APPROACH_STEPS = 60
+APPROACH_HOLD = 15
 
 
 def segment(kind, samples, size, variant):
@@ -94,6 +97,8 @@ def record(args):
     output = args.output
     output.mkdir(parents=True, exist_ok=True)
     config = {k: v for k, v in vars(args).items() if k != "output"}
+    if args.pattern == "classic":
+        config.pop("pattern")
     config["control_mode"] = CONTROL_MODE
     config_path = output / "config.json"
     if config_path.exists():
@@ -105,12 +110,13 @@ def record(args):
         write_json(config_path, config)
 
     rng = np.random.default_rng(args.seed)
+    build_examples = examples if args.pattern == "classic" else diverse_patterns.examples
     manifest = []
     env = None
     batch_size = None
     try:
         for split, count in (("train", args.train_per_kind), ("test", args.test_per_kind)):
-            entries = examples(split, count, args.steps, rng)
+            entries = build_examples(split, count, args.steps, rng)
             for index in range(0, len(entries), args.num_envs):
                 batch = entries[index:index + args.num_envs]
                 label = f"{split}_{index // args.num_envs:04d}"
@@ -127,13 +133,26 @@ def record(args):
                                        sim_backend="gpu", render_backend="gpu", obs_mode="rgb")
                     env.reset(seed=seed)
                     start = as_numpy(env.unwrapped.tcp_in_base.p)
+                    approach = None
+                    if args.pattern == diverse_patterns.VERSION:
+                        offsets = np.asarray([item["start_offset_mm"] for item in metadata],
+                                             dtype=np.float32) / 1000
+                        u = np.linspace(0, 1, APPROACH_STEPS, dtype=np.float32)[:, None, None]
+                        approach = start[None] + u * u * (3 - 2 * u) * offsets[None]
+                        approach = np.pad(approach, ((0, APPROACH_HOLD), (0, 0), (0, 0)), mode="edge")
+                        start = approach[-1]
                     targets = start[None] + np.stack([item[0] for item in batch], axis=1)
+                    if approach is not None:
+                        low, high = np.array([0.30, -0.24, 0.10]), np.array([0.70, 0.24, 0.45])
+                        if np.any(targets < low) or np.any(targets > high):
+                            raise ValueError(f"{label} exceeds the planned Panda workspace")
                     # Publish only complete, verified shards.
                     with TemporaryDirectory(prefix=f".{label}-", dir=output) as temporary:
                         staging = Path(temporary) / label
                         metrics = run_episode(env, targets, staging, "gpu", args.hold,
                                               args.tolerance_mm / 1000, seed, label,
-                                              video_envs=args.video_envs, episodes=metadata)
+                                              video_envs=args.video_envs, episodes=metadata,
+                                              approach_targets=approach)
                         if not metrics["passed"]:
                             raise RuntimeError(f"{label} exceeded tracking tolerance")
                         verify(staging)
@@ -159,15 +178,20 @@ if __name__ == "__main__":
     parser.add_argument("--test-per-kind", type=int, default=8)
     parser.add_argument("--num-envs", type=int, default=64)
     parser.add_argument("--video-envs", type=int, default=2)
-    parser.add_argument("--steps", type=int, default=240)
+    parser.add_argument("--pattern", choices=("classic", diverse_patterns.VERSION), default="classic")
+    parser.add_argument("--steps", type=int, help="Reference steps (240 classic, 320 diverse)")
     parser.add_argument("--hold", type=int, default=20)
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--tolerance-mm", type=float, default=10)
     args = parser.parse_args()
-    if (not 1 <= args.train_per_kind <= 32 or not 0 <= args.test_per_kind <= 8
+    classic = args.pattern == "classic"
+    if args.steps is None:
+        args.steps = 240 if classic else 320
+    preroll = 0 if classic else APPROACH_STEPS + APPROACH_HOLD
+    if (args.train_per_kind < 1 or args.test_per_kind < 0
+            or (classic and (args.train_per_kind > 32 or args.test_per_kind > 8))
             or args.num_envs < 1 or not 0 <= args.video_envs <= args.num_envs
-            or args.steps < 120 or args.hold < 1 or args.steps + args.hold >= 20000
+            or args.steps < 120 or args.hold < 1 or args.steps + args.hold + preroll >= 20000
             or not np.isfinite(args.tolerance_mm) or args.tolerance_mm <= 0):
-        parser.error("Require 1–32 train and 0–8 test variants, valid batch/video counts, "
-                     "at least 120 reference steps, and positive hold/tolerance")
+        parser.error("Invalid variant counts, batch/video counts, steps or tolerance")
     record(args)

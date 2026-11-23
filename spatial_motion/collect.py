@@ -23,7 +23,7 @@ def as_numpy(tensor):
 
 
 def run_episode(env, targets, directory, render, hold, tolerance, seed, name, renderer=None,
-                video_envs=None, episodes=None):
+                video_envs=None, episodes=None, approach_targets=None):
     directory.mkdir()
     raw = env.unwrapped
     obs, _ = env.reset(seed=seed)
@@ -45,6 +45,14 @@ def run_episode(env, targets, directory, render, hold, tolerance, seed, name, re
     )
     grip = torch.ones((batch, 1), device=raw.device)
     errors = np.empty((count, batch), np.float32)
+    if approach_targets is not None:
+        for target in torch.as_tensor(approach_targets, device=raw.device):
+            obs, _, term, trunc, _ = env.step(torch.cat((target, reset_rotation, grip), dim=1))
+            if term.any() or trunc.any():
+                raise RuntimeError("Episode ended during approach to the sampled start")
+        start_error = np.linalg.norm(targets[0] - as_numpy(raw.tcp_in_base.p), axis=1)
+        if not (start_error <= tolerance).all():
+            raise RuntimeError(f"Sampled start was not reached, max error {1000 * start_error.max():.2f} mm")
 
     with ExitStack() as stack:
         h5 = stack.enter_context(h5py.File(directory / "expert.h5", "w"))
@@ -58,6 +66,8 @@ def run_episode(env, targets, directory, render, hold, tolerance, seed, name, re
         )
         if render != "none":
             h5.attrs["video_envs"] = video_envs
+        if approach_targets is not None:
+            h5.attrs["preroll_steps"] = len(approach_targets)
         if episodes is not None:
             h5.create_dataset("episode/metadata_json", data=[json.dumps(item, ensure_ascii=False)
                                                             for item in episodes],
@@ -141,7 +151,6 @@ def run_episode(env, targets, directory, render, hold, tolerance, seed, name, re
     result = {
         "trajectory": name, "num_envs": batch, "tracking_steps": count - hold,
         "hold_steps": hold, "control_hz": fps, "render": render,
-        "video_envs": video_envs if render != "none" else 0,
         "video_envs": video_envs if render != "none" else 0,
         "rms_mm": (1000 * np.sqrt(np.mean(tracking ** 2, axis=0))).tolist(),
         "p95_mm": (1000 * np.percentile(tracking, 95, axis=0)).tolist(),
