@@ -3,7 +3,7 @@ import numpy as np
 
 from . import diverse_patterns as motion
 
-VERSION = "expanded-v1"
+VERSION = "expanded-v2"
 PLANES = dict(motion.PLANES, **{
     "XY tilted +30 deg about Y": ((np.sqrt(3)/2, 0, -0.5), (0, 1, 0)),
     "XY tilted -30 deg about Y": ((np.sqrt(3)/2, 0, 0.5), (0, 1, 0)),
@@ -30,7 +30,7 @@ NOVEL = {
     "figure_eight_slide": ("synchronous", ("figure_eight", "line")),
     "zigzag_delayed_lift": ("offset", ("zigzag", "lift")),
 }
-SPEEDS = (35, 50, 70)
+SPEEDS = (50, 70, 100)
 STARTS = [(x, y, z) for x in (470, 488, 505, 522, 540)
           for y in (-45, -22, 0, 22, 45) for z in (240, 260, 280, 300)]
 
@@ -160,13 +160,30 @@ def make_entry(split, kind, plane, direction, speed, size, index, version, start
         return path, labels
 
     dense, _ = sample(1025)
+    # Measure the largest point-to-point distance in the complete motion,
+    # including simultaneous components. Preserve shape and component ratios.
+    probes = dense[::16]
+    diameter = np.linalg.norm(probes[:, None] - probes[None, :], axis=-1).max()
+    nominal_sizes = sorted(set(PRIMARY[kinds[0]]) | set(TEST[kinds[0]]))
+    rank = np.interp(components[0]["radius_or_scale_mm"], nominal_sizes,
+                     np.linspace(100, 200, len(nominal_sizes)))
+    scale = rank / diameter
+    for item in components:
+        for field in ("radius_or_scale_mm", "rise_mm", "height_mm", "width_mm", "wave_length_mm"):
+            if field in item:
+                item[field] *= scale
+    dense, _ = sample(1025)
     count = int(np.ceil(np.linalg.norm(np.diff(dense, axis=0), axis=1).max()*1024*20/speed))+1
     path, labels = sample(max(16, count))
+    low, high = np.array([290, -260, 95]), np.array([710, 260, 470])
+    requested_start = start
+    start = np.clip(start, low - path.min(axis=0), high - path.max(axis=0))
     path += start
-    if not ((path >= [290,-260,95]) & (path <= [710,260,470])).all():
+    if not ((path >= low - 1e-6) & (path <= high + 1e-6)).all():
         raise ValueError(f"Workspace exceeded for {kind}, index {index}")
     metadata = dict(id=f"{VERSION}-{split}-{kind}-{index:04d}", split=split, kind=kind,
-                    segments=list(kinds), size_mm=size, frame="panda_base", start_xyz_mm=list(start),
+                    segments=list(kinds), size_mm=float(rank), frame="panda_base", start_xyz_mm=list(start),
+                    requested_start_xyz_mm=list(requested_start), shape_scale=float(scale),
                     composition=mode, components=components, component_windows=windows,
                     phase_profile=style, target_speed_mm_s=speed, motion_samples=len(path),
                     peak_target_speed_mm_s=float(np.linalg.norm(np.diff(path,axis=0),axis=1).max()*20),

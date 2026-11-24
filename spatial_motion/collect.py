@@ -2,6 +2,8 @@
 import argparse
 import csv
 import json
+import zlib
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, closing
 from pathlib import Path
 
@@ -24,7 +26,7 @@ def as_numpy(tensor):
 
 def run_episode(env, targets, directory, render, hold, tolerance, seed, name, renderer=None,
                 video_envs=None, episodes=None, approach_targets=None, rgb_compression="lzf",
-                start_tolerance=None):
+                start_tolerance=None, rgb_writer_threads=0):
     directory.mkdir()
     raw = env.unwrapped
     obs, _ = env.reset(seed=seed)
@@ -56,6 +58,9 @@ def run_episode(env, targets, directory, render, hold, tolerance, seed, name, re
             raise RuntimeError(f"Sampled start was not reached, max error {1000 * start_error.max():.2f} mm")
 
     with ExitStack() as stack:
+        rgb_pool = (stack.enter_context(ThreadPoolExecutor(rgb_writer_threads))
+                    if rgb_writer_threads else None)
+        rgb_group = min(batch, 8) if rgb_pool else 1
         h5 = stack.enter_context(h5py.File(directory / "expert.h5", "w"))
         h5.attrs.update(
             env_id="SpatialMotion-v1", control_mode=CONTROL_MODE, frame="panda_base",
@@ -97,7 +102,7 @@ def run_episode(env, targets, directory, render, hold, tolerance, seed, name, re
                 shape = tuple(obs["sensor_data"][camera]["rgb"].shape)
                 rgb[camera] = h5.create_dataset(
                     f"rgb/{camera}", (count + 1, *shape), "u1",
-                    chunks=(1, 1, *shape[1:]), compression=rgb_compression,
+                    chunks=(1, rgb_group, *shape[1:]), compression=rgb_compression,
                     compression_opts=1 if rgb_compression == "gzip" else None,
                 )
                 calibration[camera] = {
@@ -119,7 +124,15 @@ def run_episode(env, targets, directory, render, hold, tolerance, seed, name, re
             tcp[index] = as_numpy(tcp_pose)
             for camera in rgb:
                 frames = as_numpy(observation["sensor_data"][camera]["rgb"])
-                rgb[camera][index] = frames
+                dataset = rgb[camera]
+                if rgb_pool is None:
+                    dataset[index] = frames
+                else:
+                    padded = np.pad(frames, ((0, (-batch) % rgb_group), (0, 0), (0, 0), (0, 0)))
+                    groups = padded.reshape(-1, rgb_group, *frames.shape[1:])
+                    compressed = rgb_pool.map(lambda group: zlib.compress(group, 1), groups)
+                    for group, chunk in enumerate(compressed):
+                        dataset.id.write_direct_chunk((index, group * rgb_group, 0, 0, 0), chunk)
                 for key, dataset in calibration[camera].items():
                     dataset[index] = as_numpy(observation["sensor_param"][camera][key])
                 for slot in range(video_envs):

@@ -1,6 +1,7 @@
 """Generate language-conditioned, GPU-batched Panda trajectories."""
 import argparse
 import json
+import shutil
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -100,6 +101,9 @@ def record(args):
     expanded = args.pattern == expanded_patterns.VERSION
     if not expanded:
         config.pop("pilot")
+        config.pop("rgb_writer_threads")
+        config.pop("worker_count")
+        config.pop("worker_index")
     if args.pattern == "classic":
         config.pop("pattern")
     config["control_mode"] = CONTROL_MODE
@@ -127,12 +131,16 @@ def record(args):
             else:
                 entries = build_examples(split, count, args.steps, rng)
             for index in range(0, len(entries), args.num_envs):
+                if expanded and (index // args.num_envs) % args.worker_count != args.worker_index:
+                    continue
                 batch = entries[index:index + args.num_envs]
                 label = f"{split}_{index // args.num_envs:04d}"
                 destination = output / label
                 seed = args.seed + index + (10000 if split == "test" else 0)
                 metadata = [item[1] for item in batch]
                 if not destination.exists():
+                    if expanded and shutil.disk_usage(output).free < 3 * 1024**3:
+                        raise RuntimeError("Less than 3 GiB available; verified shards are resumable")
                     if len(batch) != batch_size:
                         if env is not None:
                             env.close()
@@ -172,7 +180,8 @@ def record(args):
                                               video_envs=args.video_envs, episodes=metadata,
                                               approach_targets=approach,
                                               rgb_compression="gzip" if expanded else "lzf",
-                                              start_tolerance=0.002 if expanded else None)
+                                              start_tolerance=0.002 if expanded else None,
+                                              rgb_writer_threads=args.rgb_writer_threads if expanded else 0)
                         if not metrics["passed"]:
                             raise RuntimeError(f"{label} exceeded tracking tolerance")
                         verify(staging)
@@ -200,6 +209,10 @@ if __name__ == "__main__":
     parser.add_argument("--video-envs", type=int, default=2)
     parser.add_argument("--pattern", choices=("classic", diverse_patterns.VERSION, expanded_patterns.VERSION), default="classic")
     parser.add_argument("--pilot", type=int, default=0, help="Expanded pilot examples per family per split")
+    parser.add_argument("--rgb-writer-threads", type=int, default=8,
+                        help="Workers for lossless expanded RGB compression; zero uses HDF5 compression")
+    parser.add_argument("--worker-count", type=int, default=1)
+    parser.add_argument("--worker-index", type=int, default=0)
     parser.add_argument("--steps", type=int, help="Reference steps (240 classic, 320 diverse)")
     parser.add_argument("--hold", type=int, default=20)
     parser.add_argument("--seed", type=int, default=2026)
@@ -212,6 +225,8 @@ if __name__ == "__main__":
     if (args.train_per_kind < 1 or args.test_per_kind < 0
             or (classic and (args.train_per_kind > 32 or args.test_per_kind > 8))
             or args.num_envs < 1 or not 0 <= args.video_envs <= args.num_envs
+            or args.pilot < 0 or args.rgb_writer_threads < 0
+            or not 0 <= args.worker_index < args.worker_count
             or args.steps < 120 or args.hold < 1 or args.steps + args.hold + preroll >= 20000
             or not np.isfinite(args.tolerance_mm) or args.tolerance_mm <= 0):
         parser.error("Invalid variant counts, batch/video counts, steps or tolerance")
