@@ -7,7 +7,7 @@ from tempfile import TemporaryDirectory
 import gymnasium as gym
 import numpy as np
 
-from . import diverse_patterns
+from . import diverse_patterns, expanded_patterns
 from .collect import as_numpy, run_episode
 from .env import CONTROL_MODE
 from .verify import verify
@@ -97,6 +97,9 @@ def record(args):
     output = args.output
     output.mkdir(parents=True, exist_ok=True)
     config = {k: v for k, v in vars(args).items() if k != "output"}
+    expanded = args.pattern == expanded_patterns.VERSION
+    if not expanded:
+        config.pop("pilot")
     if args.pattern == "classic":
         config.pop("pattern")
     config["control_mode"] = CONTROL_MODE
@@ -115,8 +118,14 @@ def record(args):
     env = None
     batch_size = None
     try:
-        for split, count in (("train", args.train_per_kind), ("test", args.test_per_kind)):
-            entries = build_examples(split, count, args.steps, rng)
+        splits = (("train",0), ("validation",0), ("test",0)) if expanded else (
+            ("train", args.train_per_kind), ("test", args.test_per_kind))
+        for split, count in splits:
+            if expanded:
+                entries = sorted(expanded_patterns.examples(split, args.seed, args.pilot),
+                                 key=lambda item: len(item[0]))
+            else:
+                entries = build_examples(split, count, args.steps, rng)
             for index in range(0, len(entries), args.num_envs):
                 batch = entries[index:index + args.num_envs]
                 label = f"{split}_{index // args.num_envs:04d}"
@@ -134,15 +143,24 @@ def record(args):
                     env.reset(seed=seed)
                     start = as_numpy(env.unwrapped.tcp_in_base.p)
                     approach = None
-                    if args.pattern == diverse_patterns.VERSION:
-                        offsets = np.asarray([item["start_offset_mm"] for item in metadata],
-                                             dtype=np.float32) / 1000
+                    if args.pattern != "classic":
+                        if expanded:
+                            first = np.stack([item[0][0] for item in batch])
+                            offsets = first - start
+                        else:
+                            offsets = np.asarray([item["start_offset_mm"] for item in metadata],
+                                                 dtype=np.float32) / 1000
                         u = np.linspace(0, 1, APPROACH_STEPS, dtype=np.float32)[:, None, None]
                         approach = start[None] + u * u * (3 - 2 * u) * offsets[None]
                         approach = np.pad(approach, ((0, APPROACH_HOLD), (0, 0), (0, 0)), mode="edge")
                         start = approach[-1]
-                    targets = start[None] + np.stack([item[0] for item in batch], axis=1)
-                    if approach is not None:
+                    if expanded:
+                        horizon = max(len(item[0]) for item in batch)
+                        targets = np.stack([np.pad(item[0], ((0,horizon-len(item[0])),(0,0)),
+                                                   mode="edge") for item in batch], axis=1)
+                    else:
+                        targets = start[None] + np.stack([item[0] for item in batch], axis=1)
+                    if approach is not None and not expanded:
                         low, high = np.array([0.30, -0.24, 0.10]), np.array([0.70, 0.24, 0.45])
                         if np.any(targets < low) or np.any(targets > high):
                             raise ValueError(f"{label} exceeds the planned Panda workspace")
@@ -152,7 +170,9 @@ def record(args):
                         metrics = run_episode(env, targets, staging, "gpu", args.hold,
                                               args.tolerance_mm / 1000, seed, label,
                                               video_envs=args.video_envs, episodes=metadata,
-                                              approach_targets=approach)
+                                              approach_targets=approach,
+                                              rgb_compression="gzip" if expanded else "lzf",
+                                              start_tolerance=0.002 if expanded else None)
                         if not metrics["passed"]:
                             raise RuntimeError(f"{label} exceeded tracking tolerance")
                         verify(staging)
@@ -178,7 +198,8 @@ if __name__ == "__main__":
     parser.add_argument("--test-per-kind", type=int, default=8)
     parser.add_argument("--num-envs", type=int, default=64)
     parser.add_argument("--video-envs", type=int, default=2)
-    parser.add_argument("--pattern", choices=("classic", diverse_patterns.VERSION), default="classic")
+    parser.add_argument("--pattern", choices=("classic", diverse_patterns.VERSION, expanded_patterns.VERSION), default="classic")
+    parser.add_argument("--pilot", type=int, default=0, help="Expanded pilot examples per family per split")
     parser.add_argument("--steps", type=int, help="Reference steps (240 classic, 320 diverse)")
     parser.add_argument("--hold", type=int, default=20)
     parser.add_argument("--seed", type=int, default=2026)

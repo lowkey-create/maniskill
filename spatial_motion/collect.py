@@ -23,7 +23,8 @@ def as_numpy(tensor):
 
 
 def run_episode(env, targets, directory, render, hold, tolerance, seed, name, renderer=None,
-                video_envs=None, episodes=None, approach_targets=None):
+                video_envs=None, episodes=None, approach_targets=None, rgb_compression="lzf",
+                start_tolerance=None):
     directory.mkdir()
     raw = env.unwrapped
     obs, _ = env.reset(seed=seed)
@@ -51,7 +52,7 @@ def run_episode(env, targets, directory, render, hold, tolerance, seed, name, re
             if term.any() or trunc.any():
                 raise RuntimeError("Episode ended during approach to the sampled start")
         start_error = np.linalg.norm(targets[0] - as_numpy(raw.tcp_in_base.p), axis=1)
-        if not (start_error <= tolerance).all():
+        if not (start_error <= (tolerance if start_tolerance is None else start_tolerance)).all():
             raise RuntimeError(f"Sampled start was not reached, max error {1000 * start_error.max():.2f} mm")
 
     with ExitStack() as stack:
@@ -96,7 +97,8 @@ def run_episode(env, targets, directory, render, hold, tolerance, seed, name, re
                 shape = tuple(obs["sensor_data"][camera]["rgb"].shape)
                 rgb[camera] = h5.create_dataset(
                     f"rgb/{camera}", (count + 1, *shape), "u1",
-                    chunks=(1, 1, *shape[1:]), compression="lzf",
+                    chunks=(1, 1, *shape[1:]), compression=rgb_compression,
+                    compression_opts=1 if rgb_compression == "gzip" else None,
                 )
                 calibration[camera] = {
                     key: h5.create_dataset(f"camera_param/{camera}/{key}",
@@ -159,6 +161,8 @@ def run_episode(env, targets, directory, render, hold, tolerance, seed, name, re
         "tolerance_mm": 1000 * tolerance,
         "passed": bool((tracking <= tolerance).all() and (errors[-1] <= tolerance).all()),
     }
+    if approach_targets is not None:
+        result["start_mm"] = (1000 * start_error).tolist()
     (directory / "metrics.json").write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps(result), flush=True)
     return result
