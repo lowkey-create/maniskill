@@ -160,8 +160,6 @@ def run_episode(env, targets, directory, render, hold, tolerance, seed, name, re
             for slot in range(batch):
                 rows.writerow([step, slot, (step + 1) / fps, *targets[step, slot],
                                *actual[slot], *residual[slot], errors[step, slot], *command[slot]])
-        for writer in videos.values():
-            writer.close()
         h5.attrs["complete"] = True
 
     lengths = ([entry["motion_samples"] for entry in episodes]

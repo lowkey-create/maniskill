@@ -63,5 +63,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("run", type=Path)
     directory = parser.parse_args().run
-    for episode in json.loads((directory / "summary.json").read_text()):
-        print(json.dumps(verify(directory / episode["trajectory"])))
+    manifest = directory / "manifest.json"
+    if manifest.exists():
+        shards = json.loads(manifest.read_text(encoding="utf-8"))
+        runs = dict.fromkeys((directory / entry["shard"]).parent for entry in shards)
+    else:
+        episodes = json.loads((directory / "summary.json").read_text())
+        runs = [directory / episode["trajectory"] for episode in episodes]
+    for run in runs:
+        print(json.dumps(verify(run)))

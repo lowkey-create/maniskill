@@ -69,18 +69,34 @@ def figure(paths, destination, title):
     plt.close(fig)
 
 
+def grid(groups, destination, title):
+    rows = (len(groups) + 3) // 4
+    fig = plt.figure(figsize=(15, 4.3 * rows + 0.5))
+    fig.subplots_adjust(left=0.035, right=0.98, top=1 - 0.18 / rows,
+                        bottom=0.10 / rows, wspace=0.12, hspace=0.26)
+    fig.suptitle(f"{title}   |   XYZ (cm)")
+    for index, (label, paths) in enumerate(groups.items(), start=1):
+        ax = fig.add_subplot(rows, 4, index, projection="3d")
+        draw(ax, paths)
+        ax.set(title=f"{label} ({len(paths):,})", xlabel="", ylabel="", zlabel="")
+        ax.tick_params(axis="both", labelsize=7, pad=0)
+    fig.savefig(destination, dpi=130)
+    plt.close(fig)
+
+
 def plot_split(groups, directory, split, planned):
     label = "Planned geometry relative to start" if planned else "Recorded TCP in Panda base coordinates"
-    overview = plt.figure(figsize=(15, 8), layout="constrained")
-    overview.suptitle(f"{split.title()}   |   {label}")
-    for index, (kind, paths) in enumerate(groups.items(), start=1):
+    overview = {}
+    for kind, paths in groups.items():
         title = kind.replace("zigzag", "polyline").replace("_", " → ")
-        ax = overview.add_subplot(2, 4, index, projection="3d")
-        draw(ax, paths)
-        ax.set_title(f"{title} ({len(paths):,})")
-        figure(paths, directory / kind / "trajectories.png", f"{split} · {title} · {label}")
-    overview.savefig(directory / "trajectories.png", dpi=130)
-    plt.close(overview)
+        location = f"{split} · {title} · {label}"
+        overview[title] = paths
+        figure(paths, directory / kind / "trajectories.png", location)
+        planes = defaultdict(list)
+        for path in paths:
+            planes[path[0]].append(path)
+        grid(planes, directory / kind / "by_plane.png", location)
+    grid(overview, directory / "trajectories.png", f"{split.title()}   |   {label}")
 
 
 def plot_plan(plan, root):

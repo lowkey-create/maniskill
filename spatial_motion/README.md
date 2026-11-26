@@ -64,7 +64,7 @@ OMP_NUM_THREADS=1 .venv/bin/python -m spatial_motion.generate_corpus --output /r
 The plan covers 7,392 training, 1,188 validation, and 1,364 test demos.
 Each recording run produces `plan.json`, split directories, `manifest.json`
 and `missing.json`. Each split, action family, and recording shard receives
-its own `trajectories.png`. The planned and recorded plots live in separate
+its own `trajectories.png`. Each family also gets a `by_plane.png` breakdown. The planned and recorded plots live in separate
 directories. Replot recorded paths with
 `python -m spatial_motion.plot_corpus /root/rivermind-data/spatial_corpus`.
 
