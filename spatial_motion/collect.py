@@ -2,8 +2,6 @@
 import argparse
 import csv
 import json
-import zlib
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, closing
 from pathlib import Path
 
@@ -24,12 +22,40 @@ def as_numpy(tensor):
     return tensor if isinstance(tensor, np.ndarray) else tensor.detach().cpu().numpy()
 
 
+APPROACH_STEPS = 60
+APPROACH_HOLD = 20
+
+
+def prepare(env, seed, starts=None):
+    """Reset, lock the wrist pose, and move to the requested start before capture."""
+    obs, _ = env.reset(seed=seed)
+    raw = env.unwrapped
+    rotation = matrix_to_euler_angles(quaternion_to_matrix(raw.tcp_in_base.q), "XYZ")
+    grip = torch.ones((raw.num_envs, 1), device=raw.device)
+    tail = torch.cat((rotation, grip), dim=1)
+    if starts is not None:
+        initial = raw.tcp_in_base.p.clone()
+        delta = torch.as_tensor(starts, device=raw.device) - initial
+        for step in range(1, APPROACH_STEPS + APPROACH_HOLD + 1):
+            t = min(step / APPROACH_STEPS, 1)
+            target = initial + t * t * (3 - 2 * t) * delta
+            obs, _, _, _, _ = env.step(torch.cat((target, tail), dim=1))
+    return obs, tail
+
+
+def save_state(group, state):
+    for key, value in state.items():
+        if isinstance(value, dict):
+            save_state(group.create_group(key), value)
+        else:
+            group.create_dataset(key, data=as_numpy(value))
+
+
 def run_episode(env, targets, directory, render, hold, tolerance, seed, name, renderer=None,
-                video_envs=None, episodes=None, approach_targets=None, rgb_compression="lzf",
-                start_tolerance=None, rgb_writer_threads=0):
+                video_envs=None, episodes=None, starts=None, rgb_compression="lzf"):
     directory.mkdir()
     raw = env.unwrapped
-    obs, _ = env.reset(seed=seed)
+    obs, tail = prepare(env, seed, starts)
     if renderer is not None:
         obs = renderer.capture()
     robot = raw.agent.robot
@@ -38,29 +64,12 @@ def run_episode(env, targets, directory, render, hold, tolerance, seed, name, re
     video_envs = batch if video_envs is None else min(video_envs, batch)
     targets = np.concatenate((targets, np.repeat(targets[-1:], hold, axis=0)))
     count = len(targets)
-    arm = raw.agent.controller.controllers["arm"]
-    if (arm.config.frame != "root_translation:root_aligned_body_rotation"
-            or arm.config.normalize_action or arm.config.use_delta):
-        raise RuntimeError("Expected absolute Panda base-frame pose commands")
     target_tensor = torch.as_tensor(targets, device=raw.device)
-    reset_rotation = matrix_to_euler_angles(
-        quaternion_to_matrix(raw.tcp_in_base.q), "XYZ"
-    )
-    grip = torch.ones((batch, 1), device=raw.device)
     errors = np.empty((count, batch), np.float32)
-    if approach_targets is not None:
-        for target in torch.as_tensor(approach_targets, device=raw.device):
-            obs, _, term, trunc, _ = env.step(torch.cat((target, reset_rotation, grip), dim=1))
-            if term.any() or trunc.any():
-                raise RuntimeError("Episode ended during approach to the sampled start")
-        start_error = np.linalg.norm(targets[0] - as_numpy(raw.tcp_in_base.p), axis=1)
-        if not (start_error <= (tolerance if start_tolerance is None else start_tolerance)).all():
-            raise RuntimeError(f"Sampled start was not reached, max error {1000 * start_error.max():.2f} mm")
+    if starts is not None:
+        start_error = np.linalg.norm(starts - as_numpy(raw.tcp_in_base.p), axis=1)
 
     with ExitStack() as stack:
-        rgb_pool = (stack.enter_context(ThreadPoolExecutor(rgb_writer_threads))
-                    if rgb_writer_threads else None)
-        rgb_group = min(batch, 8) if rgb_pool else 1
         h5 = stack.enter_context(h5py.File(directory / "expert.h5", "w"))
         h5.attrs.update(
             env_id="SpatialMotion-v1", control_mode=CONTROL_MODE, frame="panda_base",
@@ -72,8 +81,9 @@ def run_episode(env, targets, directory, render, hold, tolerance, seed, name, re
         )
         if render != "none":
             h5.attrs["video_envs"] = video_envs
-        if approach_targets is not None:
-            h5.attrs["preroll_steps"] = len(approach_targets)
+        if starts is not None:
+            h5.attrs["preroll_steps"] = APPROACH_STEPS + APPROACH_HOLD
+            save_state(h5.create_group("initial_state"), raw.get_state_dict())
         if episodes is not None:
             h5.create_dataset("episode/metadata_json", data=[json.dumps(item, ensure_ascii=False)
                                                             for item in episodes],
@@ -102,7 +112,7 @@ def run_episode(env, targets, directory, render, hold, tolerance, seed, name, re
                 shape = tuple(obs["sensor_data"][camera]["rgb"].shape)
                 rgb[camera] = h5.create_dataset(
                     f"rgb/{camera}", (count + 1, *shape), "u1",
-                    chunks=(1, rgb_group, *shape[1:]), compression=rgb_compression,
+                    chunks=(1, 1, *shape[1:]), compression=rgb_compression,
                     compression_opts=1 if rgb_compression == "gzip" else None,
                 )
                 calibration[camera] = {
@@ -124,15 +134,7 @@ def run_episode(env, targets, directory, render, hold, tolerance, seed, name, re
             tcp[index] = as_numpy(tcp_pose)
             for camera in rgb:
                 frames = as_numpy(observation["sensor_data"][camera]["rgb"])
-                dataset = rgb[camera]
-                if rgb_pool is None:
-                    dataset[index] = frames
-                else:
-                    padded = np.pad(frames, ((0, (-batch) % rgb_group), (0, 0), (0, 0), (0, 0)))
-                    groups = padded.reshape(-1, rgb_group, *frames.shape[1:])
-                    compressed = rgb_pool.map(lambda group: zlib.compress(group, 1), groups)
-                    for group, chunk in enumerate(compressed):
-                        dataset.id.write_direct_chunk((index, group * rgb_group, 0, 0, 0), chunk)
+                rgb[camera][index] = frames
                 for key, dataset in calibration[camera].items():
                     dataset[index] = as_numpy(observation["sensor_param"][camera][key])
                 for slot in range(video_envs):
@@ -141,7 +143,7 @@ def run_episode(env, targets, directory, render, hold, tolerance, seed, name, re
 
         record_state(0, obs)
         for step, target in enumerate(target_tensor):
-            action = torch.cat((target, reset_rotation, grip), dim=1)
+            action = torch.cat((target, tail), dim=1)
             obs, _, term, trunc, _ = env.step(action)
             if renderer is not None:
                 obs = renderer.capture()
@@ -162,20 +164,23 @@ def run_episode(env, targets, directory, render, hold, tolerance, seed, name, re
             writer.close()
         h5.attrs["complete"] = True
 
-    tracking = errors[:count - hold]
+    lengths = ([entry["motion_samples"] for entry in episodes]
+               if episodes is not None else [count - hold] * batch)
+    tracking = [errors[:length, slot] for slot, length in enumerate(lengths)]
+    maximum = [float(1000 * path.max()) for path in tracking]
+    final = [float(1000 * errors[length + hold - 1, slot]) for slot, length in enumerate(lengths)]
     result = {
         "trajectory": name, "num_envs": batch, "tracking_steps": count - hold,
         "hold_steps": hold, "control_hz": fps, "render": render,
         "video_envs": video_envs if render != "none" else 0,
-        "rms_mm": (1000 * np.sqrt(np.mean(tracking ** 2, axis=0))).tolist(),
-        "p95_mm": (1000 * np.percentile(tracking, 95, axis=0)).tolist(),
-        "max_mm": (1000 * np.max(tracking, axis=0)).tolist(),
-        "final_mm": (1000 * errors[-1]).tolist(),
-        "tolerance_mm": 1000 * tolerance,
-        "passed": bool((tracking <= tolerance).all() and (errors[-1] <= tolerance).all()),
+        "rms_mm": [float(1000 * np.sqrt(np.mean(path ** 2))) for path in tracking],
+        "p95_mm": [float(1000 * np.percentile(path, 95)) for path in tracking],
+        "max_mm": maximum, "final_mm": final, "tolerance_mm": 1000 * tolerance,
+        "passed": max(maximum + final) <= 1000 * tolerance,
     }
-    if approach_targets is not None:
+    if starts is not None:
         result["start_mm"] = (1000 * start_error).tolist()
+        result["passed"] &= bool((start_error <= 0.002).all())
     (directory / "metrics.json").write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps(result), flush=True)
     return result

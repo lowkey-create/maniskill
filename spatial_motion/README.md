@@ -48,54 +48,26 @@ The shaded interval marks the endpoint hold.
 .venv/bin/python -m spatial_motion.plot_trajectories spatial_motion/run_rgb --output spatial_motion/run_rgb/trajectories.png
 ```
 
-## Generate a language-conditioned corpus
+## Run the collection plan
 
-On a CUDA and Vulkan host, run from the repository root:
-
-```bash
-OMP_NUM_THREADS=1 IMAGEIO_FFMPEG_EXE=/usr/bin/ffmpeg .venv/bin/python -m spatial_motion.generate_corpus --output spatial_motion/run_corpus
-```
-
-The defaults generate 256 train and 64 held-out-size test episodes across eight
-families, including two sequential compositions. Both splits contain the same
-families and use disjoint size grids. This measures parameter generalization.
-Each trajectory uses 240 reference steps and 20 endpoint hold steps by default.
-Each episode includes an English instruction with geometry and direction, and
-keeps both RGB streams and the original observation/action alignment.
-
-`manifest.json` indexes the split, instruction, parameters, HDF5 shard and
-environment slot. Each shard also embeds its episode metadata. GPU batches are
-verified before publication. Repeat the same command to resume from complete
-shards. `--num-envs` sets the batch size and `--video-envs` sets the number of
-preview videos per camera and shard. All environments retain raw RGB in HDF5.
-
-Render an equal-scale overview of recorded and target paths by trajectory family:
+On a Linux host with CUDA, Vulkan, ManiSkill 3.0.1, h5py, matplotlib, imageio
+and FFmpeg, run from the repository root. Use separate new directories for the
+plan, pilot, and corpus.
 
 ```bash
-.venv/bin/python -m spatial_motion.plot_corpus spatial_motion/run_corpus --output spatial_motion/run_corpus/trajectory_overview.png
+.venv/bin/python -m unittest spatial_motion.test_plan
+.venv/bin/python -m spatial_motion.generate_corpus --plan-only --output spatial_motion/run_plan
+OMP_NUM_THREADS=1 .venv/bin/python -m spatial_motion.generate_corpus --pilot --output /root/rivermind-data/spatial_pilot
+OMP_NUM_THREADS=1 .venv/bin/python -m spatial_motion.generate_corpus --output /root/rivermind-data/spatial_corpus
 ```
 
-### Diverse three-dimensional trajectories
+The plan covers 7,392 training, 1,188 validation, and 1,364 test demos.
+Each recording run produces `plan.json`, split directories, `manifest.json`
+and `missing.json`. Each split, action family, and recording shard receives
+its own `trajectories.png`. The planned and recorded plots live in separate
+directories. Replot recorded paths with
+`python -m spatial_motion.plot_corpus /root/rivermind-data/spatial_corpus`.
 
-Run from the repository root on a CUDA and Vulkan host:
-
-```bash
-OMP_NUM_THREADS=1 IMAGEIO_FFMPEG_EXE=/usr/bin/ffmpeg .venv/bin/python -m spatial_motion.generate_corpus \
-  --pattern diverse-v1 --output spatial_motion/run_diverse_hz01/corpus \
-  --num-envs 128 --train-per-kind 36 --test-per-kind 8
-```
-
-This configuration generates 792 episodes in 18 families. It includes eight
-single motions and ten compositions using ordered segments, simultaneous vector
-addition, or addition with a delayed start and early finish. Reversed orders
-are available for line/circle and circle/helix. Component scales, phase windows,
-direction, axes and plane are recorded in each HDF5 episode's metadata and the
-corpus manifest. The primary scale uses an even-mm training grid and an odd-mm
-test grid. The split measures generalization to held-out primary scales within
-the same families.
-
-A short approach moves the Panda to its sampled start before the first saved
-observation. The recorded horizon is fixed across a batch but the time spent
-moving varies. Use `motion_samples` to find the moving reference interval.
-References then repeat the endpoint up to the fixed horizon and explicit hold.
-The manifest includes the motion duration and commanded mean and peak speed.
+`--num-envs` controls GPU batch size. `--video-envs` controls preview MP4s
+per camera and shard. Both RGB streams remain in HDF5 for every episode.
+See [collection notes](NOTES.md) for geometry, storage, and acceptance details.

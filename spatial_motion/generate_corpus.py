@@ -1,233 +1,202 @@
-"""Generate language-conditioned, GPU-batched Panda trajectories."""
+"""Build, pilot, or record the SpatialMotion Cartesian-product corpus."""
 import argparse
 import json
-import shutil
 from pathlib import Path
-from tempfile import TemporaryDirectory
 
-import gymnasium as gym
 import numpy as np
 
-from . import diverse_patterns, expanded_patterns
-from .collect import as_numpy, run_episode
-from .env import CONTROL_MODE
-from .verify import verify
+from .plan import SPLITS, START_INDICES, STARTS, motions, pilot_plan
+from .plot_corpus import plot_plan, plot_recorded
 
-KINDS = ("line", "diagonal", "circle", "ellipse", "helix", "zigzag",
-         "line_circle", "circle_helix")
-APPROACH_STEPS = 60
-APPROACH_HOLD = 15
+HOLD = 20
+START_TOLERANCE_M = 0.002
+TRACK_TOLERANCE_M = 0.010
 
 
-def segment(kind, samples, size, variant):
-    u = np.linspace(0, 1, samples)
-    side = (-1) ** variant
-    radius = size / 1000
-    if kind in ("line", "diagonal"):
-        delta = np.array([-size, side * (20 + size // 2),
-                          0 if kind == "line" else (-1) ** (variant // 2) * (20 + size // 3)])
-        return u[:, None] * delta / 1000, (
-            f"Move in a straight line by ({delta[0]}, {delta[1]}, {delta[2]}) mm "
-            "along the Panda base X, Y, and Z axes."
-        )
-    if kind == "zigzag":
-        width = size // 2
-        vertices = np.array([[0, 0, 0], [-size / 3, side * width, 0],
-                             [-2 * size / 3, -side * width, 0], [-size, 0, 0]])
-        points = np.column_stack([np.interp(u, np.linspace(0, 1, 4), col)
-                                  for col in vertices.T]) / 1000
-        return points, (f"Trace a horizontal three-segment zigzag spanning {size} mm along "
-                        f"negative X and {2 * width} mm across Y, starting toward "
-                        f"{'positive' if side == 1 else 'negative'} Y.")
-    direction = "counterclockwise" if side == 1 else "clockwise"
-    angle = side * (4 if kind == "helix" else 2) * np.pi * u
-    if kind == "helix":
-        radial_mm = size // 2
-        rise_mm = size + 20
-        radial = radial_mm / 1000
-        return np.column_stack((radial * (np.cos(angle) - 1),
-                                radial * np.sin(angle), rise_mm / 1000 * u)), (
-            f"Trace a two-turn {direction} helix viewed from positive Z, with "
-            f"radius {radial_mm} mm and total rise {rise_mm} mm."
-        )
-    minor = size if kind == "circle" else (3 * size) // 5
-    points = np.column_stack((radius * (np.cos(angle) - 1),
-                              minor / 1000 * np.sin(angle), np.zeros_like(u)))
-    shape = (f"circle with radius {size} mm" if kind == "circle"
-             else f"ellipse with X and Y semiaxes {size} and {minor} mm")
-    return points, (f"Trace a horizontal {shape}, {direction} viewed from positive Z, "
-                    "starting at its positive-X edge.")
+def write_json(path, value):
+    path.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
-def trajectory(kind, steps, size, variant):
-    if kind in ("line_circle", "circle_helix"):
-        first, second = ("line", "circle") if kind == "line_circle" else ("circle", "helix")
-        split = steps // 2
-        # A shared endpoint preserves continuity and gives each part its own reference.
-        a, instruction_a = segment(first, split + 1, size, variant)
-        b, instruction_b = segment(second, steps - split, size, variant)
-        return np.concatenate((a, a[-1] + b[1:])), (
-            f"{instruction_a} Then, from the endpoint, {instruction_b[0].lower()}{instruction_b[1:]}"
-        ), [first, second]
-    points, instruction = segment(kind, steps, size, variant)
-    return points, instruction, [kind]
+def requests(plan, pilot):
+    geometries = {}
+    for split, entries in plan.items():
+        for case, motion in entries:
+            key = (motion.kind, motion.plane, tuple(motion.parameters.items()))
+            group = geometries.setdefault(key, (motion, []))
+            ranks = (0,) if pilot and split == "train" else START_INDICES[split]
+            for rank in ranks:
+                group[1].append((split, f"{case}-{rank + 1}", rank))
+    return sorted(geometries.values(), key=lambda group: len(group[0].path))
 
 
-def examples(split, count, steps, rng):
-    entries = []
-    for kind in KINDS:
-        for variant in range(count):
-            size = 24 + 2 * variant if split == "train" else 25 + 8 * variant
-            points, language, segments = trajectory(kind, steps, size, variant)
-            metadata = {
-                "id": f"{split}-{kind}-{variant:03d}", "split": split,
-                "kind": kind, "segments": segments, "size_mm": size,
-                "variant": variant, "language": language, "frame": "panda_base",
-            }
-            entries.append((points.astype(np.float32), metadata))
-    return [entries[i] for i in rng.permutation(len(entries))]
+def targets_for(paths, starts):
+    longest = max(map(len, paths))
+    return np.stack([np.pad(path, ((0, longest - len(path)), (0, 0)), mode="edge")
+                     for path in paths], axis=1) + starts
 
 
-def write_json(path, data):
-    temporary = path.with_suffix(".tmp")
-    temporary.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    temporary.replace(path)
+def check_candidates(env, paths, starts, seed):
+    import torch
+
+    from .collect import prepare
+
+    _, tail = prepare(env, seed, starts)
+    raw = env.unwrapped
+    lengths = torch.as_tensor([len(path) for path in paths], device=raw.device)
+    goals = torch.as_tensor(targets_for(paths, starts), device=raw.device)
+    origin = torch.as_tensor(starts, device=raw.device)
+    passed = torch.linalg.vector_norm(raw.tcp_in_base.p - origin, dim=1) <= START_TOLERANCE_M
+    for step in range(len(goals) + HOLD):
+        goal = goals[min(step, len(goals) - 1)]
+        _, _, terminated, truncated, _ = env.step(torch.cat((goal, tail), dim=1))
+        error = torch.linalg.vector_norm(raw.tcp_in_base.p - goal, dim=1)
+        check = (step < lengths) | (step == lengths + HOLD - 1)
+        passed &= (~check | (error <= TRACK_TOLERANCE_M)) & ~terminated & ~truncated
+    return passed.cpu().numpy()
 
 
-def record(args):
-    output = args.output
-    output.mkdir(parents=True, exist_ok=True)
-    config = {k: v for k, v in vars(args).items() if k != "output"}
-    expanded = args.pattern == expanded_patterns.VERSION
-    if not expanded:
-        config.pop("pilot")
-        config.pop("rgb_writer_threads")
-        config.pop("worker_count")
-        config.pop("worker_index")
-    if args.pattern == "classic":
-        config.pop("pattern")
-    config["control_mode"] = CONTROL_MODE
-    config_path = output / "config.json"
-    if config_path.exists():
-        if json.loads(config_path.read_text()) != config:
-            raise ValueError("Resume requires the same configuration")
-    else:
-        if any(output.iterdir()):
-            raise ValueError("Use an empty output directory for a new run")
-        write_json(config_path, config)
+def select_starts(env, group, seed):
+    batch = env.unwrapped.num_envs
+    paths = [motion.path[1:] for motion, _ in group]
+    paths.extend([paths[-1]] * (batch - len(paths)))
+    required = np.asarray([1 + max(rank for _, _, rank in slots) for _, slots in group])
+    chosen = [[] for _ in group]
+    available = np.ones((len(group), len(STARTS)), dtype=bool)
+    distances = np.linalg.norm(STARTS[:, None] - STARTS[None], axis=-1)
+    center_score = -np.linalg.norm(STARTS - (STARTS.max(axis=0) + STARTS.min(axis=0)) / 2, axis=1)
+    candidate = np.zeros(batch, dtype=int)
+    active = np.arange(len(group))
+    while len(active):
+        for slot in active:
+            score = distances[chosen[slot]].min(axis=0) if chosen[slot] else center_score
+            candidate[slot] = np.argmax(np.where(available[slot], np.round(score, 7), -np.inf))
+        passed = check_candidates(env, paths, STARTS[candidate], seed)
+        for slot in active:
+            selection = candidate[slot]
+            available[slot, selection] = False
+            if passed[slot]:
+                chosen[slot].append(selection)
+        active = [slot for slot in active if len(chosen[slot]) < required[slot] and available[slot].any()]
+    return chosen
 
-    rng = np.random.default_rng(args.seed)
-    build_examples = examples if args.pattern == "classic" else diverse_patterns.examples
+
+def plan_starts(geometries, batch, args):
+    import gymnasium as gym
+
+    selected = {split: [] for split in SPLITS}
+    missing = []
+    env = gym.make("SpatialMotion-v1", num_envs=batch, sim_backend=args.sim,
+                   render_backend="none", obs_mode="state_dict")
+    try:
+        for offset in range(0, len(geometries), batch):
+            group = geometries[offset:offset + batch]
+            for (motion, slots), starts in zip(group, select_starts(env, group, args.seed)):
+                for split, case, rank in slots:
+                    entry = dict(motion.metadata(), id=case, split=split, start_rank=rank + 1)
+                    if rank >= len(starts):
+                        missing.append(dict(entry, reason="insufficient reachable starts"))
+                    else:
+                        start = STARTS[starts[rank]]
+                        selected[split].append((motion, dict(entry, start_xyz_m=start.tolist())))
+            print(f"Checked starts for {min(offset + batch, len(geometries))}/{len(geometries)} "
+                  f"geometries, missing episodes: {len(missing)}", flush=True)
+    finally:
+        env.close()
+    return selected, missing
+
+
+def record(selected, missing, args):
+    import gymnasium as gym
+    import h5py
+
+    from .collect import run_episode
+    from .metrics import measure
+    from .verify import verify
+
+    root = args.output
     manifest = []
     env = None
-    batch_size = None
+    batch = 0
     try:
-        splits = (("train",0), ("validation",0), ("test",0)) if expanded else (
-            ("train", args.train_per_kind), ("test", args.test_per_kind))
-        for split, count in splits:
-            if expanded:
-                entries = sorted(expanded_patterns.examples(split, args.seed, args.pilot),
-                                 key=lambda item: len(item[0]))
-            else:
-                entries = build_examples(split, count, args.steps, rng)
-            for index in range(0, len(entries), args.num_envs):
-                if expanded and (index // args.num_envs) % args.worker_count != args.worker_index:
-                    continue
-                batch = entries[index:index + args.num_envs]
-                label = f"{split}_{index // args.num_envs:04d}"
-                destination = output / label
-                seed = args.seed + index + (10000 if split == "test" else 0)
-                metadata = [item[1] for item in batch]
-                if not destination.exists():
-                    if expanded and shutil.disk_usage(output).free < 3 * 1024**3:
-                        raise RuntimeError("Less than 3 GiB available; verified shards are resumable")
-                    if len(batch) != batch_size:
-                        if env is not None:
-                            env.close()
-                        env = None
-                        batch_size = len(batch)
-                        env = gym.make("SpatialMotion-v1", num_envs=batch_size,
-                                       sim_backend="gpu", render_backend="gpu", obs_mode="rgb")
-                    env.reset(seed=seed)
-                    start = as_numpy(env.unwrapped.tcp_in_base.p)
-                    approach = None
-                    if args.pattern != "classic":
-                        if expanded:
-                            first = np.stack([item[0][0] for item in batch])
-                            offsets = first - start
-                        else:
-                            offsets = np.asarray([item["start_offset_mm"] for item in metadata],
-                                                 dtype=np.float32) / 1000
-                        u = np.linspace(0, 1, APPROACH_STEPS, dtype=np.float32)[:, None, None]
-                        approach = start[None] + u * u * (3 - 2 * u) * offsets[None]
-                        approach = np.pad(approach, ((0, APPROACH_HOLD), (0, 0), (0, 0)), mode="edge")
-                        start = approach[-1]
-                    if expanded:
-                        horizon = max(len(item[0]) for item in batch)
-                        targets = np.stack([np.pad(item[0], ((0,horizon-len(item[0])),(0,0)),
-                                                   mode="edge") for item in batch], axis=1)
-                    else:
-                        targets = start[None] + np.stack([item[0] for item in batch], axis=1)
-                    if approach is not None and not expanded:
-                        low, high = np.array([0.30, -0.24, 0.10]), np.array([0.70, 0.24, 0.45])
-                        if np.any(targets < low) or np.any(targets > high):
-                            raise ValueError(f"{label} exceeds the planned Panda workspace")
-                    # Publish only complete, verified shards.
-                    with TemporaryDirectory(prefix=f".{label}-", dir=output) as temporary:
-                        staging = Path(temporary) / label
-                        metrics = run_episode(env, targets, staging, "gpu", args.hold,
-                                              args.tolerance_mm / 1000, seed, label,
-                                              video_envs=args.video_envs, episodes=metadata,
-                                              approach_targets=approach,
-                                              rgb_compression="gzip" if expanded else "lzf",
-                                              start_tolerance=0.002 if expanded else None,
-                                              rgb_writer_threads=args.rgb_writer_threads if expanded else 0)
-                        if not metrics["passed"]:
-                            raise RuntimeError(f"{label} exceeded tracking tolerance")
-                        verify(staging)
-                        staging.rename(destination)
-                metrics = json.loads((destination / "metrics.json").read_text())
-                if not metrics["passed"]:
-                    raise RuntimeError(f"{label} failed its tracking check")
-                for slot, example in enumerate(metadata):
-                    manifest.append({**example, "shard": f"{label}/expert.h5", "slot": slot,
-                                     "max_error_mm": metrics["max_mm"][slot]})
-                write_json(output / "manifest.json", manifest)
-                print(f"Verified {label}: {len(batch)} episodes, "
-                      f"max {max(metrics['max_mm']):.2f} mm", flush=True)
+        for split, entries in selected.items():
+            for offset in range(0, len(entries), args.num_envs):
+                group = entries[offset:offset + args.num_envs]
+                if len(group) != batch:
+                    if env is not None:
+                        env.close()
+                    batch = len(group)
+                    env = gym.make("SpatialMotion-v1", num_envs=batch, sim_backend=args.sim,
+                                   render_backend="gpu", obs_mode="rgb")
+                directory = root / split / f"batch_{offset // args.num_envs:04d}"
+                directory.parent.mkdir(exist_ok=True)
+                metadata = [entry for _, entry in group]
+                starts = np.asarray([entry["start_xyz_m"] for entry in metadata], dtype=np.float32)
+                goals = targets_for([motion.path[1:] for motion, _ in group], starts)
+                result = run_episode(env, goals, directory, "gpu", HOLD, TRACK_TOLERANCE_M,
+                                     args.seed, directory.name, video_envs=args.video_envs,
+                                     episodes=metadata, starts=starts, rgb_compression="gzip")
+                verify(directory)
+                with h5py.File(directory / "expert.h5") as data:
+                    for slot, (motion, entry) in enumerate(group):
+                        entry.update(shard=(directory / "expert.h5").relative_to(root).as_posix(),
+                                     slot=slot, start_error_mm=result["start_mm"][slot],
+                                     max_error_mm=result["max_mm"][slot],
+                                     final_error_mm=result["final_mm"][slot])
+                        if entry["start_error_mm"] > 2 or max(entry["max_error_mm"],
+                                                              entry["final_error_mm"]) > 10:
+                            missing.append(dict(entry, reason="failed recorded tracking"))
+                            continue
+                        if motion.kind in ("line", "circle"):
+                            count = len(motion.path)
+                            actual = data["state/tcp_pose_base"][:count, slot, :3]
+                            entry["geometry_metrics"] = measure(entry, motion.path, actual)
+                        manifest.append(entry)
+                write_json(root / "manifest.json", manifest)
+                write_json(root / "missing.json", missing)
     finally:
         if env is not None:
             env.close()
+    return manifest
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--output", type=Path, required=True)
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--plan-only", action="store_true")
+    mode.add_argument("--pilot", action="store_true")
+    parser.add_argument("--num-envs", type=int, default=64)
+    parser.add_argument("--sim", choices=("cpu", "gpu"), default="gpu")
+    parser.add_argument("--seed", type=int, default=2026)
+    parser.add_argument("--video-envs", type=int, default=1)
+    args = parser.parse_args()
+    if args.sim == "cpu":
+        args.num_envs = 1
+    plan = {split: [(f"{split}-{index:04d}", motion) for index, motion in enumerate(motions(split))]
+            for split in SPLITS}
+    if args.pilot:
+        plan = pilot_plan(plan)
+    geometries = requests(plan, args.pilot)
+    args.output.mkdir(parents=True)
+    counts = {split: sum(item[0] == split for _, group in geometries for item in group)
+              for split in SPLITS}
+    write_json(args.output / "plan.json", {"episodes": counts, "geometries": [
+        dict(motion.metadata(), episodes=[dict(split=split, id=case, start_rank=rank + 1)
+                                           for split, case, rank in slots])
+        for motion, slots in geometries
+    ]})
+    print(f"Planned episodes: {counts}", flush=True)
+    plot_plan(plan, args.output / "plan")
+    if args.plan_only:
+        return 0
+    selected, missing = plan_starts(geometries, min(args.num_envs, len(geometries)), args)
+    manifest = record(selected, missing, args)
+    write_json(args.output / "manifest.json", manifest)
+    write_json(args.output / "missing.json", missing)
+    plot_recorded(args.output, manifest)
+    print(f"Accepted {len(manifest)} episodes, missing {len(missing)}", flush=True)
+    return int(bool(missing))
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--train-per-kind", type=int, default=32)
-    parser.add_argument("--test-per-kind", type=int, default=8)
-    parser.add_argument("--num-envs", type=int, default=64)
-    parser.add_argument("--video-envs", type=int, default=2)
-    parser.add_argument("--pattern", choices=("classic", diverse_patterns.VERSION, expanded_patterns.VERSION), default="classic")
-    parser.add_argument("--pilot", type=int, default=0, help="Expanded pilot examples per family per split")
-    parser.add_argument("--rgb-writer-threads", type=int, default=8,
-                        help="Workers for lossless expanded RGB compression; zero uses HDF5 compression")
-    parser.add_argument("--worker-count", type=int, default=1)
-    parser.add_argument("--worker-index", type=int, default=0)
-    parser.add_argument("--steps", type=int, help="Reference steps (240 classic, 320 diverse)")
-    parser.add_argument("--hold", type=int, default=20)
-    parser.add_argument("--seed", type=int, default=2026)
-    parser.add_argument("--tolerance-mm", type=float, default=10)
-    args = parser.parse_args()
-    classic = args.pattern == "classic"
-    if args.steps is None:
-        args.steps = 240 if classic else 320
-    preroll = 0 if classic else APPROACH_STEPS + APPROACH_HOLD
-    if (args.train_per_kind < 1 or args.test_per_kind < 0
-            or (classic and (args.train_per_kind > 32 or args.test_per_kind > 8))
-            or args.num_envs < 1 or not 0 <= args.video_envs <= args.num_envs
-            or args.pilot < 0 or args.rgb_writer_threads < 0
-            or not 0 <= args.worker_index < args.worker_count
-            or args.steps < 120 or args.hold < 1 or args.steps + args.hold + preroll >= 20000
-            or not np.isfinite(args.tolerance_mm) or args.tolerance_mm <= 0):
-        parser.error("Invalid variant counts, batch/video counts, steps or tolerance")
-    record(args)
+    raise SystemExit(main())
